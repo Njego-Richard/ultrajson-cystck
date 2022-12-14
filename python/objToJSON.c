@@ -36,15 +36,15 @@ http://www.opensource.apple.com/source/tcl/tcl-14/tcl/license.terms
 * Copyright (c) 1994 Sun Microsystems, Inc.
 */
 
-#include <Python.h>
+#include "../../include/Cystck.h"
 #include <stdio.h>
-#include <ultrajson.h>
+#include "../lib/ultrajson.h"
 
 #define EPOCH_ORD 719163
 
 typedef void *(*PFN_PyTypeToJSON)(JSOBJ obj, JSONTypeContext *ti, void *outValue, size_t *_outLen);
 
-int object_is_decimal_type(PyObject *obj);
+int object_is_decimal_type(Py_State *S, Cystck_Object obj);
 
 typedef struct __TypeContext
 {
@@ -53,25 +53,25 @@ typedef struct __TypeContext
   JSPFN_ITERGETNAME iterGetName;
   JSPFN_ITERGETVALUE iterGetValue;
   PFN_PyTypeToJSON PyTypeToJSON;
-  PyObject *newObj;
-  PyObject *dictObj;
-  Py_ssize_t index;
-  Py_ssize_t size;
-  PyObject *itemValue;
-  PyObject *itemName;
-  PyObject *attrList;
-  PyObject *iterator;
+  Cystck_Object newObj;
+  Cystck_Object dictObj;
+  Cystck_ssize_t index;
+  Cystck_ssize_t size;
+  Cystck_Object itemValue;
+  Cystck_Object itemName;
+  Cystck_Object attrList;
+  Cystck_Object iterator;
 
   union
   {
-    PyObject *rawJSONValue;
+    Cystck_Object rawJSONValue;
     JSINT64 longValue;
     JSUINT64 unsignedLongValue;
   };
 } TypeContext;
 
 #define GET_TC(__ptrtc) ((TypeContext *)((__ptrtc)->prv))
-
+#define GET_PyState(__ptrtc) ((Py_State *)((__ptrtc)->encoder_prv))
 // If newObj is set, we should use it rather than JSOBJ
 #define GET_OBJ(__jsobj, __ptrtc) (GET_TC(__ptrtc)->newObj ? GET_TC(__ptrtc)->newObj : __jsobj)
 
@@ -102,8 +102,10 @@ static void *PyLongToUINT64(JSOBJ _obj, JSONTypeContext *tc, void *outValue, siz
 
 static void *PyLongToINTSTR(JSOBJ _obj, JSONTypeContext *tc, void *outValue, size_t *_outLen)
 {
-  PyObject *obj = PyNumber_ToBase(_obj, 10);
-  if (!obj)
+  Py_State *S = GET_PyState(tc);
+  Cystck_Object object = Cystck_FromVoid(_obj);
+  Cystck_Object obj =  CystckNumber_Tobase(S, object,10);
+  if (Cystck_IsNULL(obj))
   {
     return NULL;
   }
@@ -113,19 +115,20 @@ static void *PyLongToINTSTR(JSOBJ _obj, JSONTypeContext *tc, void *outValue, siz
 
 static void *PyFloatToDOUBLE(JSOBJ _obj, JSONTypeContext *tc, void *outValue, size_t *_outLen)
 {
-  PyObject *obj = (PyObject *) _obj;
-  *((double *) outValue) = PyFloat_AsDouble (obj);
+  Cystck_Object obj = Cystck_FromVoid(_obj);
+  *((double *) outValue) = CystckFloat_AsDouble (GET_PyState(tc),obj);
   return NULL;
 }
 
 static void *PyStringToUTF8(JSOBJ _obj, JSONTypeContext *tc, void *outValue, size_t *_outLen)
 {
-  PyObject *obj = (PyObject *) _obj;
-  *_outLen = PyBytes_Size(obj);
-  return PyBytes_AsString(obj);
+  Py_State *S = GET_PyState(tc);
+  Cystck_Object obj = Cystck_FromVoid(_obj);
+  *_outLen = CystckBytes_GET_SIZE(S,obj);
+  return CystckBytes_AS_STRING(S,obj);
 }
 
-static char *PyUnicodeToUTF8Raw(JSOBJ _obj, size_t *_outLen, PyObject **pBytesObj)
+static char *PyUnicodeToUTF8Raw(JSOBJ _obj, size_t *_outLen, Cystck_Object *pBytesObj)
 {
   /*
   Converts the PyUnicode object to char* whose size is stored in _outLen.
@@ -133,26 +136,27 @@ static char *PyUnicodeToUTF8Raw(JSOBJ _obj, size_t *_outLen, PyObject **pBytesOb
   In that case, the returned char* is in fact the internal buffer of that PyBytes object,
   and when the char* buffer is no longer needed, the bytesObj must be DECREF'd.
   */
-  PyObject *obj = (PyObject *) _obj;
-
+  Cystck_Object obj = Cystck_FromVoid(_obj);
+  Py_State *S = Get_State();
 #ifndef Py_LIMITED_API
-  if (PyUnicode_IS_COMPACT_ASCII(obj))
+  if (CystckUnicode_IS_COMPACT_ASCII(obj))
   {
-    Py_ssize_t len;
-    char *data = PyUnicode_AsUTF8AndSize(obj, &len);
+    Cystck_ssize_t len;
+    char *data = CystckUnicode_AsUTF8AndSize(S,obj, &len);
     *_outLen = len;
     return data;
   }
 #endif
 
-  PyObject *bytesObj = *pBytesObj = PyUnicode_AsEncodedString (obj, NULL, "surrogatepass");
-  if (!bytesObj)
+  
+  Cystck_Object bytesObj = *pBytesObj = CystckUnicode_AsEncodedString(S, obj, NULL, "surrogatepass");
+  if ( Cystck_IsNULL(bytesObj))
   {
     return NULL;
   }
 
-  *_outLen = PyBytes_Size(bytesObj);
-  return PyBytes_AsString(bytesObj);
+  *_outLen = CystckBytes_Size(S,bytesObj);
+  return CystckBytes_AsString(S,bytesObj);
 }
 
 static void *PyUnicodeToUTF8(JSOBJ _obj, JSONTypeContext *tc, void *outValue, size_t *_outLen)
@@ -162,27 +166,30 @@ static void *PyUnicodeToUTF8(JSOBJ _obj, JSONTypeContext *tc, void *outValue, si
 
 static void *PyRawJSONToUTF8(JSOBJ _obj, JSONTypeContext *tc, void *outValue, size_t *_outLen)
 {
-  PyObject *obj = GET_TC(tc)->rawJSONValue;
-  if (PyUnicode_Check(obj))
+  Py_State *S = GET_PyState(tc);
+  Cystck_Object obj = GET_TC(tc)->rawJSONValue;
+  if (CystckUnicode_Check(S,obj))
   {
-    return PyUnicodeToUTF8(obj, tc, outValue, _outLen);
+    return PyUnicodeToUTF8( _obj, tc, outValue, _outLen);
   }
   else
   {
-    return PyStringToUTF8(obj, tc, outValue, _outLen);
+    return PyStringToUTF8(_obj, tc, outValue, _outLen);
   }
 }
 
 static int Tuple_iterNext(JSOBJ obj, JSONTypeContext *tc)
 {
-  PyObject *item;
+  Cystck_Object item;
+  Py_State *S = GET_PyState(tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
 
   if (GET_TC(tc)->index >= GET_TC(tc)->size)
   {
     return 0;
   }
 
-  item = PyTuple_GetItem (obj, GET_TC(tc)->index);
+  item = CystckTuple_GetItem(S,_obj, GET_TC(tc)->index);
 
   GET_TC(tc)->itemValue = item;
   GET_TC(tc)->index ++;
@@ -195,7 +202,7 @@ static void Tuple_iterEnd(JSOBJ obj, JSONTypeContext *tc)
 
 static JSOBJ Tuple_iterGetValue(JSOBJ obj, JSONTypeContext *tc)
 {
-  return GET_TC(tc)->itemValue;
+  return Cystck_AsVoidP(GET_TC(tc)->itemValue);
 }
 
 static char *Tuple_iterGetName(JSOBJ obj, JSONTypeContext *tc, size_t *outLen)
@@ -205,13 +212,15 @@ static char *Tuple_iterGetName(JSOBJ obj, JSONTypeContext *tc, size_t *outLen)
 
 static int List_iterNext(JSOBJ obj, JSONTypeContext *tc)
 {
+  Py_State *S = GET_PyState(tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj); 
   if (GET_TC(tc)->index >= GET_TC(tc)->size)
   {
     PRINTMARK();
     return 0;
   }
 
-  GET_TC(tc)->itemValue = PyList_GetItem (obj, GET_TC(tc)->index);
+  GET_TC(tc)->itemValue = CystckList_GetItem(S, _obj, GET_TC(tc)->index);
   GET_TC(tc)->index ++;
   return 1;
 }
@@ -222,7 +231,7 @@ static void List_iterEnd(JSOBJ obj, JSONTypeContext *tc)
 
 static JSOBJ List_iterGetValue(JSOBJ obj, JSONTypeContext *tc)
 {
-  return GET_TC(tc)->itemValue;
+  return Cystck_AsVoidP (GET_TC(tc)->itemValue);
 }
 
 static char *List_iterGetName(JSOBJ obj, JSONTypeContext *tc, size_t *outLen)
@@ -238,54 +247,60 @@ static char *List_iterGetName(JSOBJ obj, JSONTypeContext *tc, size_t *outLen)
 
 static int Dict_iterNext(JSOBJ obj, JSONTypeContext *tc)
 {
-  PyObject* itemNameTmp;
+  Py_State *S = GET_PyState(tc);
+  Cystck_Object itemNameTmp;
+  Cystck_pushobject(S, GET_TC(tc)->itemName);
 
-  if (GET_TC(tc)->itemName)
+  if (!Cystck_IsNULL(GET_TC(tc)->itemName))
   {
-    Py_DECREF(GET_TC(tc)->itemName);
-    GET_TC(tc)->itemName = NULL;
+    Cystck_pop(S,GET_TC(tc)->itemName);
+    GET_TC(tc)->itemName = 0;
   }
 
-  if (!(GET_TC(tc)->itemName = PyIter_Next(GET_TC(tc)->iterator)))
-  {
-    PRINTMARK();
-    return 0;
-  }
-
-  if (!(GET_TC(tc)->itemValue = PyDict_GetItem(GET_TC(tc)->dictObj, GET_TC(tc)->itemName)))
+  if ( Cystck_IsNULL(GET_TC(tc)->itemName = CystckIter_Next(S, GET_TC(tc)->iterator)))
   {
     PRINTMARK();
     return 0;
   }
 
-  if (PyUnicode_Check(GET_TC(tc)->itemName))
+  if (Cystck_IsNULL(GET_TC(tc)->itemValue = CystckDict_GetItem(S, GET_TC(tc)->dictObj, GET_TC(tc)->itemName)))
+  {
+    PRINTMARK();
+    return 0;
+  }
+
+  if (CystckUnicode_Check(S, GET_TC(tc)->itemName))
   {
     itemNameTmp = GET_TC(tc)->itemName;
-    GET_TC(tc)->itemName = PyUnicode_AsEncodedString (GET_TC(tc)->itemName, NULL, "surrogatepass");
-    Py_DECREF(itemNameTmp);
+    Cystck_pushobject(S, itemNameTmp);
+    GET_TC(tc)->itemName = CystckUnicode_AsEncodedString (S,GET_TC(tc)->itemName, NULL, "surrogatepass");
+    Cystck_pop(S,itemNameTmp);
   }
   else
-  if (!PyBytes_Check(GET_TC(tc)->itemName))
+  if (!CystckBytes_Check(S,GET_TC(tc)->itemName))
   {
-    if (UNLIKELY(GET_TC(tc)->itemName == Py_None))
+    if (UNLIKELY(GET_TC(tc)->itemName == S->Cystck_None))
     {
-      itemNameTmp = PyUnicode_FromString("null");
-      GET_TC(tc)->itemName = PyUnicode_AsUTF8String(itemNameTmp);
-      Py_DECREF(Py_None);
+      Cystck_pushobject(S, S->Cystck_None);
+      itemNameTmp = CystckUnicode_FromString(S,"null");
+      GET_TC(tc)->itemName = CystckUnicode_AsUTF8String(S, itemNameTmp);
+      Cystck_pop(S,S->Cystck_None);
       return 1;
     }
 
     itemNameTmp = GET_TC(tc)->itemName;
-    GET_TC(tc)->itemName = PyObject_Str(GET_TC(tc)->itemName);
-    Py_DECREF(itemNameTmp);
-    if (PyErr_Occurred())
+    Cystck_pushobject(S, itemNameTmp);
+    GET_TC(tc)->itemName = Cystck_Str(S,GET_TC(tc)->itemName);
+    Cystck_pop(S, itemNameTmp);
+    if (Cystck_Err_Occurred(S))
     {
       PRINTMARK();
       return -1;
     }
     itemNameTmp = GET_TC(tc)->itemName;
-    GET_TC(tc)->itemName = PyUnicode_AsEncodedString (GET_TC(tc)->itemName, NULL, "surrogatepass");
-    Py_DECREF(itemNameTmp);
+    Cystck_pushobject(S, itemNameTmp);
+    GET_TC(tc)->itemName = CystckUnicode_AsEncodedString (S, GET_TC(tc)->itemName, NULL, "surrogatepass");
+    Cystck_pop(S, itemNameTmp);
   }
   PRINTMARK();
   return 1;
@@ -293,98 +308,113 @@ static int Dict_iterNext(JSOBJ obj, JSONTypeContext *tc)
 
 static void Dict_iterEnd(JSOBJ obj, JSONTypeContext *tc)
 {
-  if (GET_TC(tc)->itemName)
+  Py_State *S = GET_PyState(tc);
+  Cystck_pushobject(S,GET_TC(tc)->itemName);
+  if (!Cystck_IsNULL(GET_TC(tc)->itemName))
   {
-    Py_DECREF(GET_TC(tc)->itemName);
-    GET_TC(tc)->itemName = NULL;
+    Cystck_pop(S,GET_TC(tc)->itemName);
+    GET_TC(tc)->itemName = 0;
   }
-  Py_CLEAR(GET_TC(tc)->iterator);
-  Py_DECREF(GET_TC(tc)->dictObj);
+  Cystck_pushobject(S,GET_TC(tc)->iterator);
+  if (!Cystck_IsNULL(GET_TC(tc)->iterator))
+  {
+    Cystck_pop(S,GET_TC(tc)->iterator);
+    GET_TC(tc)->itemName = 0;
+  }
   PRINTMARK();
 }
 
 static JSOBJ Dict_iterGetValue(JSOBJ obj, JSONTypeContext *tc)
 {
-  return GET_TC(tc)->itemValue;
+  return Cystck_AsVoidP(GET_TC(tc)->itemValue);
 }
 
 static char *Dict_iterGetName(JSOBJ obj, JSONTypeContext *tc, size_t *outLen)
 {
-  *outLen = PyBytes_Size(GET_TC(tc)->itemName);
-  return PyBytes_AsString(GET_TC(tc)->itemName);
+  Py_State *S = GET_PyState(tc);
+  *outLen = CystckBytes_GET_SIZE(S,GET_TC(tc)->itemName);
+  return CystckBytes_AS_STRING(S,GET_TC(tc)->itemName);
 }
 
 static int SortedDict_iterNext(JSOBJ obj, JSONTypeContext *tc)
 {
-  PyObject *items = NULL, *item = NULL, *key = NULL, *value = NULL;
-  Py_ssize_t i, nitems;
-  PyObject* keyTmp;
+  Cystck_Object items = 0, item = 0, key = 0, value = 0;
+  Py_State *S = GET_PyState(tc);
+  Cystck_ssize_t i, nitems;
+  Cystck_Object keyTmp;
 
   // Upon first call, obtain a list of the keys and sort them. This follows the same logic as the
   // standard library's _json.c sort_keys handler.
-  if (GET_TC(tc)->newObj == NULL)
+  if ( Cystck_IsNULL(GET_TC(tc)->newObj))
   {
     // Obtain the list of keys from the dictionary.
-    items = PyMapping_Keys(GET_TC(tc)->dictObj);
-    if (items == NULL)
+    items = CystckMapping_Keys(S, GET_TC(tc)->dictObj);
+    if (Cystck_IsNULL(items))
     {
       goto error;
     }
-    else if (!PyList_Check(items))
+    else if (!CystckList_Check(S, items))
     {
-      PyErr_SetString(PyExc_ValueError, "keys must return list");
+      CystckErr_SetString (S, S->Cystck_ValueError, "keys must return list");
       goto error;
     }
 
     // Sort the list.
-    if (PyList_Sort(items) < 0)
+    if (CystckList_Sort(S,items) < 0)
     {
-      PyErr_SetString(PyExc_ValueError, "unorderable keys");
+      CystckErr_SetString (S, S->Cystck_ValueError, "unorderable keys");
       goto error;
     }
 
     // Obtain the value for each key, and pack a list of (key, value) 2-tuples.
-    nitems = PyList_Size(items);
+    nitems = CystckList_GET_SIZE(items);
     for (i = 0; i < nitems; i++)
     {
-      key = PyList_GetItem(items, i);
-      value = PyDict_GetItem(GET_TC(tc)->dictObj, key);
+      key = CystckList_GetItem(S, items,i);
+      Cystck_pushobject(S,key);
+      value = CystckDict_GetItem (S,GET_TC(tc)->dictObj, key);
+      Cystck_pushobject(S,value);
 
       // Subject the key to the same type restrictions and conversions as in Dict_iterGetValue.
-      if (PyUnicode_Check(key))
+      if (CystckUnicode_Check(S,key))
       {
-        key = PyUnicode_AsEncodedString(key, NULL, "surrogatepass");
+        key = CystckUnicode_AsEncodedString(S, key, NULL, "surrogatepass");
+        Cystck_pushobject(S, key);
       }
-      else if (!PyBytes_Check(key))
+      else if (!CystckBytes_Check(S,key))
       {
-        key = PyObject_Str(key);
-        if (PyErr_Occurred())
+        key = Cystck_Str(S, key);
+        Cystck_pushobject(S,key);
+        if (Cystck_Err_Occurred(S))
         {
           goto error;
         }
         keyTmp = key;
-        key = PyUnicode_AsEncodedString(key, NULL, "surrogatepass");
-        Py_DECREF(keyTmp);
+        Cystck_pushobject(S,keyTmp);
+        key = CystckUnicode_AsUTF8String(S,key);
+        Cystck_pop(S,keyTmp);
       }
       else
       {
-        Py_INCREF(key);
+        Cystck_pushobject(S,key);
       }
 
-      item = PyTuple_Pack(2, key, value);
-      if (item == NULL)
+      item = Cystck_Tuple_Pack(S,2, key, value);
+      Cystck_pushobject(S,item);
+      if (Cystck_IsNULL(item) )
       {
         goto error;
       }
-      if (PyList_SetItem(items, i, item))
+      if (CystckList_SetItem(S, items, i, item))
       {
         goto error;
       }
-      Py_DECREF(key);
+      Cystck_pop(S,key);
     }
 
     // Store the sorted list of tuples in the newObj slot.
     GET_TC(tc)->newObj = items;
+    Cystck_pushobject(S, GET_TC(tc)->newObj );
     GET_TC(tc)->size = nitems;
   }
 
@@ -394,42 +424,45 @@ static int SortedDict_iterNext(JSOBJ obj, JSONTypeContext *tc)
     return 0;
   }
 
-  item = PyList_GetItem(GET_TC(tc)->newObj, GET_TC(tc)->index);
-  GET_TC(tc)->itemName = PyTuple_GetItem(item, 0);
-  GET_TC(tc)->itemValue = PyTuple_GetItem(item, 1);
+  item = CystckList_GetItem(S, GET_TC(tc)->newObj, GET_TC(tc)->index);
+  GET_TC(tc)->itemName = CystckTuple_GET_ITEM(item, 0);
+  GET_TC(tc)->itemValue = CystckTuple_GET_ITEM(item, 1);
   GET_TC(tc)->index++;
   return 1;
 
 error:
-  Py_XDECREF(item);
-  Py_XDECREF(key);
-  Py_XDECREF(value);
-  Py_XDECREF(items);
+  Cystck_pop(S, item);
+  Cystck_pop(S, key);
+  Cystck_pop(S, value);
+  Cystck_pop(S, items);
   return -1;
 }
 
 static void SortedDict_iterEnd(JSOBJ obj, JSONTypeContext *tc)
 {
-  GET_TC(tc)->itemName = NULL;
-  GET_TC(tc)->itemValue = NULL;
-  Py_DECREF(GET_TC(tc)->dictObj);
+  Py_State *S = GET_PyState(tc);
+  GET_TC(tc)->itemName = 0;
+  GET_TC(tc)->itemValue = 0;
+  //Cystck_pop(S, GET_TC(tc)->dictObj);
   PRINTMARK();
 }
 
 static JSOBJ SortedDict_iterGetValue(JSOBJ obj, JSONTypeContext *tc)
 {
-  return GET_TC(tc)->itemValue;
+  return Cystck_AsVoidP(GET_TC(tc)->itemValue);
 }
 
 static char *SortedDict_iterGetName(JSOBJ obj, JSONTypeContext *tc, size_t *outLen)
 {
-  *outLen = PyBytes_Size(GET_TC(tc)->itemName);
-  return PyBytes_AsString(GET_TC(tc)->itemName);
+  Py_State *S = GET_PyState(tc);
+  *outLen = CystckBytes_GET_SIZE(S,GET_TC(tc)->itemName); 
+  return CystckBytes_AS_STRING(S,GET_TC(tc)->itemName);
 }
 
-static void SetupDictIter(PyObject *dictObj, TypeContext *pc, JSONObjectEncoder *enc)
+static void SetupDictIter(Py_State *S, Cystck_Object dictObj, TypeContext *pc, JSONObjectEncoder *enc)
 {
   pc->dictObj = dictObj;
+  //Cystck_pop(S, pc->dictObj);
   if (enc->sortKeys)
   {
     pc->iterEnd = SortedDict_iterEnd;
@@ -444,13 +477,14 @@ static void SetupDictIter(PyObject *dictObj, TypeContext *pc, JSONObjectEncoder 
     pc->iterNext = Dict_iterNext;
     pc->iterGetValue = Dict_iterGetValue;
     pc->iterGetName = Dict_iterGetName;
-    pc->iterator = PyObject_GetIter(dictObj);
+    pc->iterator = Cystck_GetIter(S, dictObj);
   }
 }
 
 static void Object_beginTypeContext (JSOBJ _obj, JSONTypeContext *tc, JSONObjectEncoder *enc)
 {
-  PyObject *obj, *objRepr, *exc, *defaultFn, *newObj;
+  Py_State *S = GET_PyState(tc);
+  Cystck_Object obj, objRepr, defaultFn, newObj;
   int level = 0;
   TypeContext *pc;
   PRINTMARK();
@@ -460,76 +494,74 @@ static void Object_beginTypeContext (JSOBJ _obj, JSONTypeContext *tc, JSONObject
     return;
   }
 
-  obj = (PyObject*) _obj;
-  defaultFn = (PyObject*) enc->prv;
+  obj = Cystck_FromVoid( _obj);
+  defaultFn = Cystck_FromVoid( enc->prv);
 
-  tc->prv = PyObject_Malloc(sizeof(TypeContext));
+  tc->prv = malloc(sizeof(TypeContext));
   pc = (TypeContext *) tc->prv;
   if (!pc)
   {
     tc->type = JT_INVALID;
-    PyErr_NoMemory();
+    CystckErr_NoMemory(S);
     return;
   }
-  pc->newObj = NULL;
-  pc->dictObj = NULL;
-  pc->itemValue = NULL;
-  pc->itemName = NULL;
-  pc->iterator = NULL;
-  pc->attrList = NULL;
+  pc->newObj = 0;
+  pc->dictObj = 0;
+  pc->itemValue = 0;
+  pc->itemName = 0;
+  pc->iterator = 0;
+  pc->attrList = 0;
   pc->index = 0;
   pc->size = 0;
   pc->longValue = 0;
-  pc->rawJSONValue = NULL;
+  pc->rawJSONValue = 0;
 
 BEGIN:
-  if (PyIter_Check(obj))
+  if (CystckIter_Check(S, obj))
   {
     PRINTMARK();
     goto ISITERABLE;
   }
 
-  if (PyBool_Check(obj))
+  if (CystckBool_check(S,obj))
   {
     PRINTMARK();
-    tc->type = (obj == Py_True) ? JT_TRUE : JT_FALSE;
+    tc->type = Cystck_IsTrue(S,obj) ? JT_TRUE : JT_FALSE;
     return;
   }
   else
-  if (PyLong_Check(obj))
+  if (CystckLong_check(S,obj))
   {
     PRINTMARK();
     pc->PyTypeToJSON = PyLongToINT64;
     tc->type = JT_LONG;
-    GET_TC(tc)->longValue = PyLong_AsLongLong(obj);
+    GET_TC(tc)->longValue = CystckLong_AsLongLong(S, obj);
 
-    exc = PyErr_Occurred();
-    if (!exc)
+    if (!Cystck_Err_Occurred (S) )
     {
         return;
     }
 
-    if (exc && PyErr_ExceptionMatches(PyExc_OverflowError))
+    if (Cystck_Err_Occurred (S) && CystckErr_EXceptionMatches(S,PyExc_OverflowError))
     {
-      PyErr_Clear();
+      Cystck_Err_Clear(S);
       pc->PyTypeToJSON = PyLongToUINT64;
       tc->type = JT_ULONG;
-      GET_TC(tc)->unsignedLongValue = PyLong_AsUnsignedLongLong(obj);
+      GET_TC(tc)->unsignedLongValue = CystckLong_AsUnsignedLongLong(S, obj);
 
-      exc = PyErr_Occurred();
     }
 
-    if (exc && PyErr_ExceptionMatches(PyExc_OverflowError))
+    if (Cystck_Err_Occurred (S) && CystckErr_EXceptionMatches(S, PyExc_OverflowError))
     {
-      PyErr_Clear();
+      Cystck_Err_Clear(S);
       pc->PyTypeToJSON = PyLongToINTSTR;
       tc->type = JT_RAW;
       // Overwritten by PyLong_* due to the union, which would lead to a DECREF in endTypeContext.
-      GET_TC(tc)->rawJSONValue = NULL;
+      GET_TC(tc)->rawJSONValue = 0;
       return;
     }
 
-    if (exc)
+    if (Cystck_Err_Occurred (S))
     {
       PRINTMARK();
       goto INVALID;
@@ -538,12 +570,12 @@ BEGIN:
     return;
   }
   else
-  if (UNLIKELY(PyBytes_Check(obj)))
+  if (UNLIKELY(CystckBytes_Check(S,obj)))
   {
     PRINTMARK();
     if (enc->rejectBytes)
     {
-      PyErr_Format (PyExc_TypeError, "reject_bytes is on and '%s' is bytes", PyBytes_AsString(obj));
+      CystckErr_SetString (S, S->Cystck_TypeError, "reject_bytes is on ");
       goto INVALID;
     }
     else
@@ -553,21 +585,21 @@ BEGIN:
     }
   }
   else
-  if (PyUnicode_Check(obj))
+  if (CystckUnicode_Check(S,obj))
   {
     PRINTMARK();
     pc->PyTypeToJSON = PyUnicodeToUTF8; tc->type = JT_UTF8;
     return;
   }
   else
-  if (obj == Py_None)
+  if (obj == S->Cystck_None)
   {
     PRINTMARK();
     tc->type = JT_NULL;
     return;
   }
   else
-  if (PyFloat_Check(obj) || object_is_decimal_type(obj))
+  if (CystckFloat_check(S, obj) || object_is_decimal_type(S, obj))
   {
     PRINTMARK();
     pc->PyTypeToJSON = PyFloatToDOUBLE; tc->type = JT_DOUBLE;
@@ -575,16 +607,16 @@ BEGIN:
   }
 
 ISITERABLE:
-  if (PyDict_Check(obj))
+  if (CystckDict_Check(S, obj))
   {
     PRINTMARK();
     tc->type = JT_OBJECT;
-    SetupDictIter(obj, pc, enc);
-    Py_INCREF(obj);
+    SetupDictIter(S, obj, pc, enc);
+    Cystck_pushobject(S,obj);
     return;
   }
   else
-  if (PyList_Check(obj))
+  if (CystckList_Check(S, obj))
   {
     PRINTMARK();
     tc->type = JT_ARRAY;
@@ -593,11 +625,11 @@ ISITERABLE:
     pc->iterGetValue = List_iterGetValue;
     pc->iterGetName = List_iterGetName;
     GET_TC(tc)->index =  0;
-    GET_TC(tc)->size = PyList_Size( (PyObject *) obj);
+    GET_TC(tc)->size = CystckList_GET_SIZE(obj);
     return;
   }
   else
-  if (PyTuple_Check(obj))
+  if (CystckTuple_Check(S, obj))
   {
     PRINTMARK();
     tc->type = JT_ARRAY;
@@ -606,61 +638,67 @@ ISITERABLE:
     pc->iterGetValue = Tuple_iterGetValue;
     pc->iterGetName = Tuple_iterGetName;
     GET_TC(tc)->index = 0;
-    GET_TC(tc)->size = PyTuple_Size( (PyObject *) obj);
-    GET_TC(tc)->itemValue = NULL;
+    GET_TC(tc)->size = CystckTuple_GET_SIZE(obj);
+    GET_TC(tc)->itemValue = 0;
 
     return;
   }
 
-  if (UNLIKELY(PyObject_HasAttrString(obj, "toDict")))
+  if (UNLIKELY(Cystck_HasAttrString(S, obj, "toDict")))
   {
-    PyObject* toDictFunc = PyObject_GetAttrString(obj, "toDict");
-    PyObject* tuple = PyTuple_New(0);
-    PyObject* toDictResult = PyObject_Call(toDictFunc, tuple, NULL);
-    Py_DECREF(tuple);
-    Py_DECREF(toDictFunc);
+    Cystck_Object toDictFunc = Cystck_GetAttr_String(S,obj,"toDict");
+    Cystck_pushobject(S,toDictFunc);
+    Cystck_Object tuple = CystckTuple_New(S,0);
+    Cystck_pushobject(S,tuple);
+    Cystck_Object toDictResult = Cystck_Call(S,toDictFunc, tuple, 0);
+    Cystck_pushobject(S,toDictResult);
+    Cystck_pop(S, tuple);
+    Cystck_pop(S, toDictFunc);
 
-    if (toDictResult == NULL)
+    if (Cystck_IsNULL(toDictResult))
     {
       goto INVALID;
     }
 
-    if (!PyDict_Check(toDictResult))
+    if (!CystckDict_Check(S,toDictResult))
     {
-      Py_DECREF(toDictResult);
+      Cystck_pop(S, toDictResult);
       tc->type = JT_NULL;
       return;
     }
 
     PRINTMARK();
     tc->type = JT_OBJECT;
-    SetupDictIter(toDictResult, pc, enc);
+    SetupDictIter(S, toDictResult, pc, enc);
     return;
   }
   else
-  if (UNLIKELY(PyObject_HasAttrString(obj, "__json__")))
+  if (UNLIKELY(Cystck_HasAttrString(S, obj, "__json__")))
   {
-    PyObject* toJSONFunc = PyObject_GetAttrString(obj, "__json__");
-    PyObject* tuple = PyTuple_New(0);
-    PyObject* toJSONResult = PyObject_Call(toJSONFunc, tuple, NULL);
-    Py_DECREF(tuple);
-    Py_DECREF(toJSONFunc);
+    Cystck_Object toJSONFunc = Cystck_GetAttr_String(S,obj, "__json__");
+    Cystck_pushobject(S, toJSONFunc);
+    Cystck_Object tuple = CystckTuple_New(S,0);
+    Cystck_pushobject(S, tuple);
+    Cystck_Object toJSONResult = Cystck_Call(S,toJSONFunc, tuple, 0);
+    Cystck_pushobject(S, toJSONResult);
+    Cystck_pop(S, tuple);
+    Cystck_pop(S, toJSONFunc);
 
-    if (toJSONResult == NULL)
+    if (Cystck_IsNULL(toJSONResult))
     {
       goto INVALID;
     }
 
-    if (PyErr_Occurred())
+    if (Cystck_Err_Occurred(S))
     {
-      Py_DECREF(toJSONResult);
+      Cystck_pop(S, toJSONResult);
       goto INVALID;
     }
 
-    if (!PyBytes_Check(toJSONResult) && !PyUnicode_Check(toJSONResult))
+    if (!CystckBytes_Check(S,toJSONResult) && !CystckUnicode_Check(S,toJSONResult))
     {
-      Py_DECREF(toJSONResult);
-      PyErr_Format (PyExc_TypeError, "expected string");
+      Cystck_pop(S, toJSONResult);
+      CystckErr_SetString (S, S->Cystck_TypeError, "expected string");
       goto INVALID;
     }
 
@@ -668,25 +706,27 @@ ISITERABLE:
     pc->PyTypeToJSON = PyRawJSONToUTF8;
     tc->type = JT_RAW;
     GET_TC(tc)->rawJSONValue = toJSONResult;
+    Cystck_pushobject(S, GET_TC(tc)->rawJSONValue);
     return;
   }
 
 DEFAULT:
-  if (defaultFn)
+  if (!Cystck_IsNULL(defaultFn))
   {
     // Break infinite loop
     if (level >= DEFAULT_FN_MAX_DEPTH)
     {
       PRINTMARK();
-      PyErr_Format(PyExc_TypeError, "maximum recursion depth exceeded");
+      CystckErr_SetString (S, S->Cystck_TypeError, "maximum recursion depth exceeded");
       goto INVALID;
     }
 
-    newObj = PyObject_CallFunctionObjArgs(defaultFn, obj, NULL);
-    if (newObj)
+    newObj = Py2Cystck(PyObject_CallFunctionObjArgs( Cystck2py(defaultFn), Cystck2py(obj), NULL));
+    Cystck_pushobject(S, pc->newObj);
+    if (!Cystck_IsNULL(newObj))
     {
       PRINTMARK();
-      Py_XDECREF(pc->newObj);
+      Cystck_pop(S, pc->newObj);
       obj = pc->newObj = newObj;
       level += 1;
       goto BEGIN;
@@ -698,51 +738,58 @@ DEFAULT:
   }
 
   PRINTMARK();
-  PyErr_Clear();
+  Cystck_Err_Clear(S);
 
-  objRepr = PyObject_Repr(obj);
-  if (!objRepr)
+  objRepr = Cystck_Repr(S, obj);
+  Cystck_pushobject(S,objRepr);
+  if ( Cystck_IsNULL(objRepr))
   {
     goto INVALID;
   }
-  PyObject* str = PyUnicode_AsEncodedString(objRepr, NULL, "strict");
-  if (str)
+  Cystck_Object str = CystckUnicode_AsEncodedString(S,objRepr, NULL, "strict");
+  Cystck_pushobject(S,str);
+  if (!Cystck_IsNULL(str))
   {
-    PyErr_Format (PyExc_TypeError, "%s is not JSON serializable", PyBytes_AsString(str));
+    CystckErr_SetString (S, S->Cystck_TypeError, "object is not JSON serializable");
   }
-  Py_XDECREF(str);
-  Py_DECREF(objRepr);
+  Cystck_pop(S,str);
+  Cystck_pop(S,objRepr);
 
 INVALID:
   PRINTMARK();
   tc->type = JT_INVALID;
-  PyObject_Free(tc->prv);
+  free(tc->prv);
   tc->prv = NULL;
   return;
 }
 
 static void Object_endTypeContext(JSOBJ obj, JSONTypeContext *tc)
 {
-  Py_XDECREF(GET_TC(tc)->newObj);
+  Py_State *S = GET_PyState(tc);
+  //Cystck_pop(S, GET_TC(tc)->newObj);
 
   if (tc->type == JT_RAW)
   {
-    Py_XDECREF(GET_TC(tc)->rawJSONValue);
+    //Cystck_pop(S, GET_TC(tc)->rawJSONValue);
   }
-  PyObject_Free(tc->prv);
+  free(tc->prv);
   tc->prv = NULL;
 }
 
 static const char *Object_getStringValue(JSOBJ obj, JSONTypeContext *tc, size_t *_outLen)
 {
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);
   return GET_TC(tc)->PyTypeToJSON (obj, tc, NULL, _outLen);
 }
 
 static JSINT64 Object_getLongValue(JSOBJ obj, JSONTypeContext *tc)
 {
   JSINT64 ret;
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);
   GET_TC(tc)->PyTypeToJSON (obj, tc, &ret, NULL);
   return ret;
 }
@@ -750,7 +797,9 @@ static JSINT64 Object_getLongValue(JSOBJ obj, JSONTypeContext *tc)
 static JSUINT64 Object_getUnsignedLongValue(JSOBJ obj, JSONTypeContext *tc)
 {
   JSUINT64 ret;
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);
   GET_TC(tc)->PyTypeToJSON (obj, tc, &ret, NULL);
   return ret;
 }
@@ -758,59 +807,69 @@ static JSUINT64 Object_getUnsignedLongValue(JSOBJ obj, JSONTypeContext *tc)
 static double Object_getDoubleValue(JSOBJ obj, JSONTypeContext *tc)
 {
   double ret;
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);
   GET_TC(tc)->PyTypeToJSON (obj, tc, &ret, NULL);
   return ret;
 }
 
 static void Object_releaseObject(JSOBJ _obj)
 {
-  Py_DECREF( (PyObject *) _obj);
+  Cystck_Object obj = Cystck_FromVoid(_obj);
 }
 
 static int Object_iterNext(JSOBJ obj, JSONTypeContext *tc)
 {
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);  
   return GET_TC(tc)->iterNext(obj, tc);
 }
 
 static void Object_iterEnd(JSOBJ obj, JSONTypeContext *tc)
 {
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);
   GET_TC(tc)->iterEnd(obj, tc);
 }
 
 static JSOBJ Object_iterGetValue(JSOBJ obj, JSONTypeContext *tc)
 {
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);
   return GET_TC(tc)->iterGetValue(obj, tc);
 }
 
 static char *Object_iterGetName(JSOBJ obj, JSONTypeContext *tc, size_t *outLen)
 {
-  obj = GET_OBJ(obj, tc);
+  Cystck_Object _obj = Cystck_FromVoid(obj);
+  _obj = GET_OBJ(_obj, tc);
+  obj = Cystck_AsVoidP(_obj);
   return GET_TC(tc)->iterGetName(obj, tc, outLen);
 }
 
-PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
+Cystck_Object objToJSON(Py_State *S, Cystck_Object args, Cystck_Object kwargs)
 {
   static char *kwlist[] = { "obj", "ensure_ascii", "encode_html_chars", "escape_forward_slashes", "sort_keys", "indent", "allow_nan", "reject_bytes", "default", "separators", NULL };
 
   char buffer[65536];
   char *ret;
   const char *csNan = NULL, *csInf = NULL;
-  PyObject *newobj;
-  PyObject *oinput = NULL;
-  PyObject *oensureAscii = NULL;
-  PyObject *oencodeHTMLChars = NULL;
-  PyObject *oescapeForwardSlashes = NULL;
-  PyObject *osortKeys = NULL;
-  PyObject *odefaultFn = NULL;
-  PyObject *oseparators = NULL;
-  PyObject *oseparatorsItem = NULL;
-  PyObject *separatorsItemBytes = NULL;
-  PyObject *oseparatorsKey = NULL;
-  PyObject *separatorsKeyBytes = NULL;
+  Cystck_Object newobj;
+  Cystck_Object oinput = 0;
+  Cystck_Object oensureAscii = 0;
+  Cystck_Object oencodeHTMLChars = 0;
+  Cystck_Object oescapeForwardSlashes = 0;
+  Cystck_Object osortKeys = 0;
+  Cystck_Object odefaultFn = 0;
+  Cystck_Object oseparators = 0;
+  Cystck_Object oseparatorsItem = 0;
+  Cystck_Object separatorsItemBytes = 0;
+  Cystck_Object oseparatorsKey = 0;
+  Cystck_Object separatorsKeyBytes = 0;
   int allowNan = -1;
   int orejectBytes = -1;
   size_t retLen;
@@ -828,9 +887,9 @@ PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
     Object_iterGetValue,
     Object_iterGetName,
     Object_releaseObject,
-    PyObject_Malloc,
-    PyObject_Realloc,
-    PyObject_Free,
+    malloc,
+    realloc,
+    free,
     -1, //recursionMax
     1, //forceAscii
     0, //encodeHTMLChars
@@ -846,30 +905,31 @@ PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
     NULL, //prv
   };
 
-
+  encoder.prv =S;
   PRINTMARK();
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOOOiiiOO", kwlist, &oinput, &oensureAscii, &oencodeHTMLChars, &oescapeForwardSlashes, &osortKeys, &encoder.indent, &allowNan, &orejectBytes, &odefaultFn, &oseparators))
+  if (!_PyArg_parseTupleAndKeywords(S, args, kwargs, "O|OOOOiiiOO", kwlist, &oinput, &oensureAscii, &oencodeHTMLChars, &oescapeForwardSlashes, &osortKeys, &encoder.indent, &allowNan, &orejectBytes, &odefaultFn, &oseparators))
   {
-    return NULL;
+    return -1;
   }
+  void *_oinput = Cystck_AsVoidP(oinput);
 
-  if (oensureAscii != NULL && !PyObject_IsTrue(oensureAscii))
+  if (!Cystck_IsNULL(oensureAscii) && !Cystck_IsTrue(S, oensureAscii))
   {
     encoder.forceASCII = 0;
   }
 
-  if (oencodeHTMLChars != NULL && PyObject_IsTrue(oencodeHTMLChars))
+  if (!Cystck_IsNULL(oencodeHTMLChars) && Cystck_IsTrue(S, oencodeHTMLChars))
   {
     encoder.encodeHTMLChars = 1;
   }
 
-  if (oescapeForwardSlashes != NULL && !PyObject_IsTrue(oescapeForwardSlashes))
+  if (!Cystck_IsNULL(oescapeForwardSlashes) && !Cystck_IsTrue(S, oescapeForwardSlashes))
   {
     encoder.escapeForwardSlashes = 0;
   }
 
-  if (osortKeys != NULL && PyObject_IsTrue(osortKeys))
+  if (!Cystck_IsNULL(osortKeys) && Cystck_IsTrue(S, osortKeys))
   {
     encoder.sortKeys = 1;
   }
@@ -879,10 +939,10 @@ PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
     encoder.allowNan = allowNan;
   }
 
-  if (odefaultFn != NULL && odefaultFn != Py_None)
+  if (!Cystck_IsNULL(odefaultFn) && odefaultFn != S->Cystck_None)
   {
     // Here use prv to store default function
-    encoder.prv = odefaultFn;
+    encoder.prv = Cystck_AsVoidP(odefaultFn);
   }
 
   if (encoder.allowNan)
@@ -896,48 +956,50 @@ PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
     encoder.rejectBytes = orejectBytes;
   }
 
-  if (oseparators != NULL && oseparators != Py_None)
+  if (!Cystck_IsNULL(oseparators) && oseparators != S->Cystck_None)
   {
-    if (!PyTuple_Check(oseparators))
+    if (!CystckTuple_Check(S, oseparators))
     {
-      PyErr_SetString(PyExc_TypeError, "expected tuple or None as separator");
-      return NULL;
+      CystckErr_SetString (S, S->Cystck_TypeError, "expected tuple or None as separator");
+      return -1;
     }
-    if (PyTuple_Size (oseparators) != 2)
+    if (CystckTuple_Size(S, oseparators) != 2)
     {
-      PyErr_SetString(PyExc_ValueError, "expected tuple of size 2 as separator");
-      return NULL;
+      CystckErr_SetString (S, S->Cystck_TypeError, "expected tuple of size 2 as separator");
+      return -1;
     }
-    oseparatorsItem = PyTuple_GetItem(oseparators, 0);
-    if (PyErr_Occurred())
+    oseparatorsItem = CystckTuple_GetItem(S,oseparators, 0);
+    if (Cystck_Err_Occurred(S))
     {
-      return NULL;
+      return -1;
     }
-    if (!PyUnicode_Check(oseparatorsItem))
+    if (!CystckUnicode_Check(S,oseparatorsItem))
     {
-      PyErr_SetString(PyExc_TypeError, "expected str as item separator");
-      return NULL;
+      CystckErr_SetString (S, S->Cystck_TypeError, "expected str as item separator");
+      return -1;
     }
-    oseparatorsKey = PyTuple_GetItem(oseparators, 1);
-    if (PyErr_Occurred())
+    oseparatorsKey = CystckTuple_GetItem(S, oseparators, 1);
+    if (Cystck_Err_Occurred(S))
     {
-      return NULL;
+      return -1;
     }
-    if (!PyUnicode_Check(oseparatorsKey))
+    if (!CystckUnicode_Check(S,oseparatorsKey))
     {
-      PyErr_SetString(PyExc_TypeError, "expected str as key separator");
-      return NULL;
+      CystckErr_SetString (S, S->Cystck_TypeError, "expected str as key separator");
+      return -1;
     }
-    encoder.itemSeparatorChars = PyUnicodeToUTF8Raw(oseparatorsItem, &encoder.itemSeparatorLength, &separatorsItemBytes);
+    encoder.itemSeparatorChars = PyUnicodeToUTF8Raw( Cystck_AsVoidP(oseparatorsItem), &encoder.itemSeparatorLength, &separatorsItemBytes);
+    Cystck_pushobject(S, separatorsItemBytes);
     if (encoder.itemSeparatorChars == NULL)
     {
-      PyErr_SetString(PyExc_ValueError, "item separator malformed");
+      CystckErr_SetString (S, S->Cystck_TypeError, "item separator malformed");
       goto ERROR;
     }
-    encoder.keySeparatorChars = PyUnicodeToUTF8Raw(oseparatorsKey, &encoder.keySeparatorLength, &separatorsKeyBytes);
+    encoder.keySeparatorChars = PyUnicodeToUTF8Raw(Cystck_AsVoidP(oseparatorsKey), &encoder.keySeparatorLength, &separatorsKeyBytes);
+    Cystck_pushobject(S, separatorsKeyBytes);
     if (encoder.keySeparatorChars == NULL)
     {
-      PyErr_SetString(PyExc_ValueError, "key separator malformed");
+      CystckErr_SetString (S, S->Cystck_TypeError, "key separator malformed");
       goto ERROR;
     }
   }
@@ -964,30 +1026,30 @@ PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
                  csInf, csNan, 'e', DCONV_DECIMAL_IN_SHORTEST_LOW, DCONV_DECIMAL_IN_SHORTEST_HIGH, 0, 0);
 
   PRINTMARK();
-  ret = JSON_EncodeObject (oinput, &encoder, buffer, sizeof (buffer), &retLen);
+  ret = JSON_EncodeObject (_oinput, &encoder, buffer, sizeof (buffer), &retLen);
   PRINTMARK();
 
   dconv_d2s_free(&encoder.d2s);
-  Py_XDECREF(separatorsItemBytes);
-  Py_XDECREF(separatorsKeyBytes);
+  Cystck_pop(S, separatorsItemBytes);
+  Cystck_pop(S, separatorsKeyBytes);
 
-  if (encoder.errorMsg && !PyErr_Occurred())
+  if (encoder.errorMsg && !Cystck_Err_Occurred(S))
   {
     // If there is an error message and we don't already have a Python exception, set one.
-    PyErr_Format (PyExc_OverflowError, "%s", encoder.errorMsg);
+    CystckErr_SetString (S, S->Cystck_OverflowError, encoder.errorMsg);
   }
 
-  if (PyErr_Occurred())
+  if (Cystck_Err_Occurred(S))
   {
     if (ret != buffer)
     {
       encoder.free (ret);
     }
 
-    return NULL;
+    return -1;
   }
 
-  newobj = PyUnicode_DecodeUTF8(ret, retLen, "surrogatepass");
+  newobj = CystckUnicode_DecodeUTF8(ret, retLen, "surrogatepass");
 
   if (ret != buffer)
   {
@@ -995,80 +1057,98 @@ PyObject* objToJSON(PyObject* self, PyObject *args, PyObject *kwargs)
   }
 
   PRINTMARK();
-
-  return newobj;
+  Cystck_pushobject(S,newobj);
+  return 1;
 
 ERROR:
-  Py_XDECREF(separatorsItemBytes);
-  Py_XDECREF(separatorsKeyBytes);
-  return NULL;
+  Cystck_pop(S, separatorsItemBytes);
+  Cystck_pop(S, separatorsKeyBytes);
+  return -1;
 }
 
-PyObject* objToJSONFile(PyObject* self, PyObject *args, PyObject *kwargs)
+Cystck_Object objToJSONFile(Py_State *S, Cystck_Object args, Cystck_Object kwargs)
 {
-  PyObject *data;
-  PyObject *file;
-  PyObject *string;
-  PyObject *write;
-  PyObject *argtuple;
-  PyObject *write_result;
+  Cystck_Object data;
+  Cystck_Object file;
+  Cystck_Object string;
+  Cystck_Object write;
+  Cystck_Object argtuple;
+  Cystck_Object write_result;
 
   PRINTMARK();
 
-  if (!PyArg_ParseTuple (args, "OO", &data, &file))
+  if (!_PyArg_parseTuple (S,args, "OO", &data, &file))
   {
-    return NULL;
+    return -1;
+  }
+  if (!Cystck_HasAttrString (S,file, "write"))
+  {
+    CystckErr_SetString (S, S->Cystck_TypeError, "expected file");
+    return -1;
+  }
+  write = Cystck_GetAttr_String (S,file, "write");
+  Cystck_pushobject(S, write);// pushcFunction
+  stackStatus(S);
+  if (Cystck_IsNULL(write))
+  {
+    Cystck_pop(S, write);
+    return -1;
+
   }
 
-  if (!PyObject_HasAttrString (file, "write"))
+  if (!Cystck_Callable_Check (S,write))
   {
-    PyErr_Format (PyExc_TypeError, "expected file");
-    return NULL;
+    Cystck_pop(S, write);
+    CystckErr_SetString (S, S->Cystck_TypeError, "expected file");
+    return -1;
   }
 
-  write = PyObject_GetAttrString (file, "write");
-
-  if (!PyCallable_Check (write))
+  argtuple = Cystck_Tuple_Pack(S,1, data); //support type tuple
+  Cystck_pushobject(S,argtuple);
+  stackStatus(S);
+  Cystck_Object  _objToJSON= Cystck_Import_ImportModule("ujson_cystck");
+  Cystck_pushobject(S, _objToJSON);
+  Cystck_Object func_dumps = Cystck_GetAttr_String (S,_objToJSON, "dumps");
+  Cystck_pushobject(S, func_dumps);
+  stackStatus(S);
+  string = Cystck_Call_Object(S,func_dumps,argtuple);
+  Cystck_pushobject(S, string);
+  stackStatus(S);
+  if (Cystck_IsNULL(string))
   {
-    Py_XDECREF(write);
-    PyErr_Format (PyExc_TypeError, "expected file");
-    return NULL;
+    Cystck_pop(S,write);
+    Cystck_pop(S,argtuple);
+    return -1;
+  }
+  Cystck_pop(S,argtuple);
+
+  argtuple = Cystck_Tuple_Pack(S, 1, string);
+  Cystck_pushobject(S, argtuple);
+  stackStatus(S);
+  if (Cystck_IsNULL(argtuple))
+  {
+    Cystck_pop(S,write);
+    return -1;
   }
 
-  argtuple = PyTuple_Pack(1, data);
-
-  string = objToJSON (self, argtuple, kwargs);
-
-  if (string == NULL)
+  write_result = Cystck_Call_Object(S,write,argtuple);
+  Cystck_pushobject(S, write_result);
+  stackStatus(S);
+  if (Cystck_IsNULL(write_result))
   {
-    Py_XDECREF(write);
-    Py_XDECREF(argtuple);
-    return NULL;
+    Cystck_pop(S,write);
+    Cystck_pop(S,argtuple);
+    return -1;
   }
-
-  Py_XDECREF(argtuple);
-
-  argtuple = PyTuple_Pack (1, string);
-  if (argtuple == NULL)
-  {
-    Py_XDECREF(write);
-    return NULL;
-  }
-
-  write_result = PyObject_CallObject (write, argtuple);
-  if (write_result == NULL)
-  {
-    Py_XDECREF(write);
-    Py_XDECREF(argtuple);
-    return NULL;
-  }
-
-  Py_DECREF(write_result);
-  Py_XDECREF(write);
-  Py_DECREF(argtuple);
-  Py_XDECREF(string);
+  Cystck_pop(S,write_result);
+  Cystck_pop(S,write);
+  Cystck_pop(S,argtuple);
+  //Cystck_pop(S, string);
 
   PRINTMARK();
 
-  Py_RETURN_NONE;
+  return 0;
 }
+Cystck_METH_DEF(objTo_JSON, "dumps",objToJSON, Cystck_METH_KEYWORDS, "Converts arbitrary object recursively into JSON. ");
+Cystck_METH_DEF(objToJSON_encode, "encode",objToJSON, Cystck_METH_KEYWORDS, "Converts arbitrary object recursively into JSON. " );
+Cystck_METH_DEF(objToJSON_File, "dump",objToJSONFile, Cystck_METH_KEYWORDS, "Converts arbitrary object recursively into JSON file. ");
